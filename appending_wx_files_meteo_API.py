@@ -1,3 +1,5 @@
+ssiddall Jan 2025
+
 #Script that will acess open meteo API to pull weather data from available models. When run, it will ask for lats and longs for area of interest, and then which wx models.
 #Program will take weatherr models listed, in order, and append them so that when the first model runs out, the ssecond model will pick up were the first left off and finish 
 #to the end of that forecast model. Can use as many models as needed as long as the longest model is used last.
