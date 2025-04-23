@@ -1,0 +1,632 @@
+import os
+import requests
+import pandas as pd
+import math
+from datetime import datetime, timedelta
+
+#------------------------------------------------------------------------------
+#Script developed to output 10 days of FBP indices from given inputs.
+#input1: download current day weather data from wildfire one. rename file to "starting_indices" and place in this path 
+#        C:\Users\ssiddall\OneDrive - Government of BC\PythonProjects\Data\10_day_indices (must adjust to your own local path)
+#input2: pull coordinates. spotwx.com
+#input3: slope. pulled from incident data
+#input4: aspect. pulled from incident data
+#input5: weather model. select from given menu. weather models will chain together until they reach furthest extent of final model selected. select shorter models first.
+#input6: fuel type. select from given menu
+#outputs will be printed in file path: C:\Users\ssiddall\OneDrive - Government of BC\PythonProjects\Data\10_day_indices
+#script uses CIFFC CFFDRS javascript code for FWI and FBP, translated to python.
+#TODO 1: script only works properly if weather stations are pushing data. Script needs to be tested for all outputs when indices available.
+#
+#Sam Siddall February 2025
+
+
+#FWI ported from R package
+#
+#
+
+def ffmc(ffmc_old, temp, rh, wind, rain, month):
+    """
+    Fine Fuel Moisture Code (FFMC) daily update.
+    I don't really know all the ins and outs, but I ported it from R.
+    """
+    # soil drying constants by month
+    cffdrs_el = [6.5, 7.5, 9.0, 12.8, 13.9, 13.9, 12.4, 10.9, 9.4, 8.0, 7.0, 6.0]
+    el = cffdrs_el[month - 1] if 1 <= month <= 12 else cffdrs_el[0]
+
+    # compute moisture equivalent CHECK
+    wmo = 147.2 * (101.0 - ffmc_old) / (59.5 + ffmc_old)
+
+    # rain adjustment
+    if rain > 0.5:
+        ra = rain - 0.5
+        if wmo > 150.0:
+            wmo += (42.5 * ra * math.exp(-100.0 / (251.0 - wmo))
+                    * (1.0 - math.exp(-6.93 / ra))
+                    + 0.0015 * (wmo - 150.0)**2 * math.sqrt(ra))
+        else:
+            wmo += (42.5 * ra * math.exp(-100.0 / (251.0 - wmo))
+                    * (1.0 - math.exp(-6.93 / ra)))
+        wmo = min(wmo, 250.0)
+
+    # calc drying/wetting thresholds CHECK
+    ed = (0.942 * (rh**0.679)
+          + 11.0 * math.exp((rh - 100.0) / 10.0)
+          + 0.18 * (21.1 - temp) * (1.0 - 1.0 / math.exp(0.115 * rh)))
+    ew = (0.618 * (rh**0.753)
+          + 10.0 * math.exp((rh - 100.0) / 10.0)
+          + 0.18 * (21.1 - temp) * (1.0 - 1.0 / math.exp(0.115 * rh)))
+
+    # update numbers daily
+    if wmo < ed:
+        z = (0.424 * (1.0 - ((100.0 - rh) / 100.0)**1.7)
+             + 0.0694 * math.sqrt(wind) * (1.0 - ((100.0 - rh) / 100.0)**8.0))
+        x = z * 0.581 * math.exp(0.0365 * temp)
+        wmo = ew + (wmo - ew) / (10.0**x)
+    else:
+        z = (0.424 * (1.0 - (rh / 100.0)**1.7)
+             + 0.0694 * math.sqrt(wind) * (1.0 - (rh / 100.0)**8.0))
+        x = z * 0.581 * math.exp(0.0365 * temp)
+        wmo = ed + (wmo - ed) / (10.0**x)
+
+    new_ffmc = 59.5 * (250.0 - wmo) / (147.2 + wmo)
+    new_ffmc = max(0.0, min(new_ffmc, 101.0))
+    return new_ffmc
+
+
+def dmc(dmc_old, temp, rh, rain, month):
+    """
+    Duff Moisture Code (DMC) daily update.
+    """
+    # day-length factor by month
+    cffdrs_el = [6.5, 7.5, 9.0, 12.8, 13.9, 13.9, 12.4,
+                 10.9, 9.4, 8.0, 7.0, 6.0]
+    el = cffdrs_el[month - 1] if 1 <= month <= 12 else cffdrs_el[0]
+
+    # heating I THINK CHECK
+    temp = max(temp, -1.1)
+    rk = 1.894 * (temp + 1.1) * (100.0 - rh) * el * 0.0001
+
+    # rain
+    if rain <= 1.5:
+        pr = dmc_old
+    else:
+        ra = rain - 1.5
+        rw = 0.92 * ra - 1.27
+        wmi = 20.0 + 280.0 / math.exp(0.023 * dmc_old)
+        if dmc_old > 65.0:
+            b = 6.2 * math.log(dmc_old) - 17.2
+        elif dmc_old > 33.0:
+            b = 14.0 - 1.3 * math.log(dmc_old)
+        else:
+            b = 100.0 / (0.5 + 0.3 * dmc_old)
+        wmr = wmi + 1000.0 * rw / (48.77 + b * rw)
+        pr = 43.43 * (5.6348 - math.log(wmr - 20.0))
+        pr = max(pr, 0.0)
+
+    new_dmc = max(pr + rk, 0.0)
+    return new_dmc
+
+
+def dc(dc_old, temp, rain, month):
+    """
+    Drought Code (DC) daily update.
+    """
+    cffdrs_fl = [-1.6, -1.6, -1.6, 0.9, 3.8, 5.8,
+                 6.4, 5.0, 2.4, 0.4, -1.6, -1.6]
+    fl = cffdrs_fl[month - 1] if 1 <= month <= 12 else cffdrs_fl[0]
+
+    temp = max(temp, -2.8)
+    pe = (0.36 * (temp + 2.8) + fl) / 2.0
+    pe = max(pe, 0.0)
+
+    dr = dc_old
+    if rain > 2.8:
+        ra = rain
+        rw = 0.83 * ra - 1.27
+        smi = 800.0 * math.exp(-dc_old / 400.0)
+        qr = smi + 3.937 * rw
+        dr = 400.0 * math.log(800.0 / qr)
+        dr = max(dr, 0.0)
+
+    new_dc = max(dr + 0.5 * pe, 0.0)
+    return new_dc
+
+
+def isi_from_ffmc(ffmc_val, wind):
+    """
+    Initial Spread Index (ISI) from FFMC.
+    """
+    fm = 147.2 * (101.0 - ffmc_val) / (59.5 + ffmc_val)
+    sf = 19.115 * math.exp(-0.1386 * fm) * (1.0 + (fm**5.31) / 4.93e7)
+    return max(0.0, sf * math.exp(0.05039 * wind))
+
+
+def bui_from_dmc_dc(dmc_val, dc_val):
+    """
+    Build-Up Index (BUI). Avoid divide-by-zero hack.
+    """
+    denom = dmc_val + 0.4 * dc_val
+    if denom == 0:
+        return 0.0  # no idea? returning zero
+    if dmc_val <= 0.4 * dc_val:
+        bui = 0.8 * dc_val * dmc_val / denom
+    else:
+        bui = dmc_val - (1.0 - 0.8 * dc_val / denom) * (0.92 + (0.0114 * dmc_val)**1.7)
+    return max(bui, 0.0)
+
+
+def fwi_index(bui_val, isi_val):
+    """
+    Final Fire Weather Index (FWI).
+    """
+    bb = 0.1 * isi_val * (0.626 * (bui_val**0.809) + 2.0)
+    return bb if bb <= 1.0 else math.exp(2.72 * (0.434 * math.log(bb))**0.647)
+
+
+def compute_daily_fwi(ffmc_old, dmc_old, dc_old,
+                      temp, rh, wind, rain, day_of_year):
+    """
+    Combine FFMC, DMC, DC, ISI, BUI, FWI for one day.
+    """
+    month = min(max((day_of_year // 30) + 1, 1), 12)
+    new_ffmc = ffmc(ffmc_old, temp, rh, wind, rain, month)
+    new_dmc = dmc(dmc_old, temp, rh, rain, month)
+    new_dc = dc(dc_old, temp, rain, month)
+    isi = isi_from_ffmc(new_ffmc, wind)
+    bui = bui_from_dmc_dc(new_dmc, new_dc)
+    fwi = fwi_index(bui, isi)
+    return new_ffmc, new_dmc, new_dc, isi, bui, fwi
+
+#FBP attempted porting from r package again
+
+#NOT SURE, REVIEW LITERATURE AGAIN FOR STATIC AND DYNAMIC
+FUEL_COEFF = [
+    {"fueltype":"M1","a":110.0,"b":0.0282,"c":1.5,"q":0.80,"bui0":50,"cbh":6,"cfl":0.80},
+    {"fueltype":"M2","a":110.0,"b":0.0282,"c":1.5,"q":0.80,"bui0":50,"cbh":6,"cfl":0.80},
+    {"fueltype":"M3","a":120.0,"b":0.0572,"c":1.4,"q":0.80,"bui0":50,"cbh":6,"cfl":0.80},
+    {"fueltype":"M4","a":100.0,"b":0.0404,"c":1.48,"q":0.80,"bui0":50,"cbh":6,"cfl":0.80},
+    {"fueltype":"C1","a":90.0,"b":0.0649,"c":4.5,"q":0.90,"bui0":72,"cbh":2,"cfl":0.75},
+    {"fueltype":"C2","a":110.0,"b":0.0282,"c":1.5,"q":0.70,"bui0":64,"cbh":3,"cfl":0.80},
+    {"fueltype":"C3","a":110.0,"b":0.0444,"c":3.0,"q":0.75,"bui0":62,"cbh":8,"cfl":1.15},
+    {"fueltype":"C4","a":110.0,"b":0.0293,"c":1.5,"q":0.80,"bui0":66,"cbh":4,"cfl":1.20},
+    {"fueltype":"C5","a":30.0,"b":0.0697,"c":4.0,"q":0.80,"bui0":56,"cbh":18,"cfl":1.20},
+    {"fueltype":"C6","a":30.0,"b":0.0800,"c":3.0,"q":0.80,"bui0":62,"cbh":7,"cfl":1.80},
+    {"fueltype":"C7","a":45.0,"b":0.0305,"c":2.0,"q":0.85,"bui0":106,"cbh":10,"cfl":0.50},
+    {"fueltype":"D1","a":30.0,"b":0.0232,"c":1.6,"q":0.90,"bui0":32,"cbh":0,"cfl":0.0},
+    {"fueltype":"S1","a":75.0,"b":0.0297,"c":1.3,"q":0.75,"bui0":38,"cbh":0,"cfl":0.0},
+    {"fueltype":"S2","a":40.0,"b":0.0438,"c":1.7,"q":0.75,"bui0":63,"cbh":0,"cfl":0.0},
+    {"fueltype":"S3","a":55.0,"b":0.0829,"c":3.2,"q":0.75,"bui0":31,"cbh":0,"cfl":0.0},
+    {"fueltype":"O1A","a":190.0,"b":0.0310,"c":1.40,"q":1.0,"bui0":1,"cbh":0,"cfl":0.0},
+    {"fueltype":"O1B","a":250.0,"b":0.0350,"c":1.7,"q":1.0,"bui0":1,"cbh":0,"cfl":0.0},
+    {"fueltype":"D2","a":6.0,"b":0.0232,"c":1.6,"q":0.90,"bui0":32,"cbh":0,"cfl":0.0}
+]
+
+
+def get_fuel_coeff(fuel_type):
+    return next((f for f in FUEL_COEFF if f['fueltype']==fuel_type), None)
+
+
+def grass(fuel_coeff, isi):
+    
+    #O1 grass formula.
+    mu = 1.0  # assume cured, adjust by month? no idea how to pull down
+    return mu * (fuel_coeff['a'] * (1 - math.exp(-fuel_coeff['b'] * isi))**fuel_coeff['c'])
+
+
+def mixed_wood(fuel_coeff, isi, bui, pc):
+    
+    #M1/M2 logic.
+    # are these all the fuel models? how do i add an option to adjust perc dead or perc conif?
+    
+    c2 = get_fuel_coeff('C2')
+    ros_c2 = c2['a']*(1-math.exp(-c2['b']*isi))**c2['c'] if c2 else 0.0
+    d1 = get_fuel_coeff('D1')
+    ros_d1 = d1['a']*(1-math.exp(-d1['b']*isi))**d1['c'] if d1 else 0.0
+    mult = 0.2 if fuel_coeff['fueltype']=='M2' else 1.0
+    return (pc/100)*ros_c2 + mult*((100-pc)/100)*ros_d1
+
+
+def dead_fir(fuel_coeff, isi, bui, pdf):
+    
+    #M3/M4 logic.
+    # are these all the fuel models? how do i add an option to adjust perc dead or perc conif?
+    
+    rosm = fuel_coeff['a']*(1-math.exp(-fuel_coeff['b']*isi))**fuel_coeff['c']
+    d1 = get_fuel_coeff('D1')
+    ros_d1 = d1['a']*(1-math.exp(-d1['b']*isi))**d1['c'] if d1 else 0.0
+    greenness = 0.2 if fuel_coeff['fueltype']=='M4' else 1.0
+    return (pdf/100)*rosm + ((100-pdf)/100)*greenness*ros_d1
+
+
+def D2_ros(fuel_coeff, isi, bui):
+    
+    #D2 logic.
+    
+    if bui >= 80:
+        return fuel_coeff['a']*(1-math.exp(-fuel_coeff['b']*isi))**fuel_coeff['c']
+    return 0.0
+
+
+def conifer(fuel_coeff, isi):
+    
+    #Default conifer formula.
+    
+    return fuel_coeff['a']*(1-math.exp(-fuel_coeff['b']*isi))**fuel_coeff['c']
+
+
+def ros_calc(fuel_coeff, isi, bui):
+    
+    #primary ROS calculator.
+    
+    ft = fuel_coeff['fueltype']
+    if ft.startswith('O1'):
+        return grass(fuel_coeff, isi)
+    if ft in ('M1','M2'):
+        return mixed_wood(fuel_coeff, isi, bui, pc=50.0)
+    if ft in ('M3','M4'):
+        return dead_fir(fuel_coeff, isi, bui, pdf=50.0)
+    if ft=='D2':
+        return D2_ros(fuel_coeff, isi, bui)
+    return conifer(fuel_coeff, isi)
+
+
+def slope_effect(ros_flat, slope):
+    
+    #Simple slope factor. not sure if useful
+    
+    return ros_flat * (1 + 0.01 * slope)
+
+
+def surface_fuel_consumption(fuel_type, ffmc, bui):
+    
+    #Just mirrored off R, need to read STX 3+ again.
+    
+    ft = fuel_type.upper()
+    if ft == 'C1':
+        return 0.75  # placeholder
+    if ft in ('C2','M3','M4'):
+        return 5*(1 - math.exp(-0.0115 * bui))
+    if ft in ('C3','C4'):
+        return 5*(1 - math.exp(-0.0164 * bui))**2.24
+    if ft in ('C5','C6'):
+        return 5*(1 - math.exp(-0.0149 * bui))**2.48
+    if ft == 'C7':
+        return 2*(1 - math.exp(-0.104*(ffmc-70))) + 1.5*(1 - math.exp(-0.0201*bui))
+    if ft.startswith('O1'):
+        return 1.0
+    if ft in ('M1','M2'):
+        return 0.5
+    if ft == 'S1':
+        return 4*(1 - math.exp(-0.025*bui)) + 4*(1 - math.exp(-0.034*bui))
+    if ft == 'S2':
+        return 10*(1 - math.exp(-0.013*bui)) + 6*(1 - math.exp(-0.060*bui))
+    if ft == 'S3':
+        return 12*(1 - math.exp(-0.0166*bui)) + 20*(1 - math.exp(-0.021*bui))
+    if ft == 'D1':
+        return 1.5*(1 - math.exp(-0.0183*bui))
+    if ft == 'D2':
+        return 1.5*(1 - math.exp(-0.0183*bui)) if bui>=80 else 0.0
+    return 0.0
+
+
+def foliar_moisture(day_of_year, lat, elev=0.0):
+    
+    # dont have a sweet clue of how to find foliar moisture in the computer,
+    # this is a placeholder, should add a TODO here
+    
+    return 85.0
+
+
+def critical_surface_intensity(cbh, fmc):
+
+    #Critical surf intensity for crowning.
+    
+    return 0.001 * ((cbh*(460 + 25.9*fmc))**1.5)
+
+
+def compute_full_fbp(fuel_type, ffmc, isi, bui, wind, slope, lat, elev, day_of_year):
+    
+    #Compute full FBP (ROS + HFI) per day.
+    
+    fc = get_fuel_coeff(fuel_type)
+    if not fc:
+        base_ros = isi * 0.2 * (1 + bui/60)
+        return base_ros, 300*base_ros
+    sfc = surface_fuel_consumption(fuel_type, ffmc, bui)
+    base_ros = ros_calc(fc, isi, bui)
+    ros_slope = slope_effect(base_ros, slope)
+    # crown check
+    is_conifer = fuel_type.startswith(('C','M'))
+    if is_conifer:
+        fmc = foliar_moisture(day_of_year, lat, elev)
+        csi = critical_surface_intensity(fc['cbh'], fmc)
+        sfi = 300 * sfc * ros_slope
+        if sfi > csi:
+            # crowning
+            cfb = 1.0
+            cfc = fc['cfl'] * cfb
+            return ros_slope, 300 * (sfc + cfc) * ros_slope
+        else:
+            return ros_slope, sfi
+    else:
+        return ros_slope, 300 * sfc * ros_slope
+
+#now kick out a pdf, help from online tools, need to learn this one
+
+def create_pdf_report(df, pdf_path):
+    """
+    Create a simple PDF report from the forecast DataFrame.
+    """
+    try:
+        from fpdf import FPDF
+    except ImportError:
+        print("Error: fpdf module not installed. Install with 'pip install fpdf2'")
+        return
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", "B", 16)
+    pdf.cell(0, 10, "10 Day Fire Indices Report", ln=True, align="C")
+    pdf.ln(10)
+    pdf.set_font("Arial", "B", 8)
+    col_width = pdf.epw / len(df.columns)
+    for header in df.columns:
+        pdf.cell(col_width, 8, str(header), border=1)
+    pdf.ln(8)
+    pdf.set_font("Arial", "", 7)
+    for idx, row in df.head(10).iterrows():
+        for item in row:
+            pdf.cell(col_width, 8, str(item), border=1)
+        pdf.ln(8)
+    pdf.output(pdf_path)
+    print(f"PDF report created at: {pdf_path}")
+
+#append?concentate? forecasts...just put them together.
+
+def main():
+    
+    # Read station data (starting indices)
+    # Chain multiple weather models to build a forecast
+    # Aggregate hourly data to daily values
+    # Prompt for user inputs (including multiple coordinates soption)
+    # Compute FWI and FBP for each station and fuel type
+    # Save results as CSV and PDF into a OneDrive-synced folder with timestamped filenames.
+    
+    csv_path = r"C:\Users\ssiddall\OneDrive - Government of BC\PythonProjects\Data\10_day_indices\starting_indices.csv"
+    if not os.path.exists(csv_path):
+        print(f"ERROR: File not found at {csv_path}")
+        return
+    df_indices = pd.read_csv(csv_path)
+    print("\nLoaded station data:")
+    print(df_indices.head())
+    if "DATE" not in df_indices.columns:
+        print("ERROR: No 'DATE' column in CSV. Cannot chain forecasts.")
+        return
+    df_indices["DATE"] = pd.to_datetime(df_indices["DATE"], errors="coerce")
+    max_csv_date = df_indices["DATE"].max()
+    if pd.isnull(max_csv_date):
+        print("ERROR: Could not parse 'DATE' in station CSV.")
+        return
+    chain_start_dt = max_csv_date + timedelta(days=1)
+    start_date_str = chain_start_dt.strftime("%Y-%m-%d")
+    print(f"\nForecast chain starts on {start_date_str}")
+
+    #user input start
+
+    multi_choice = input("Do you want to run forecasts for multiple sets of coordinates? (y/n): ").strip().lower() or "n"
+    coordinates = []
+    if multi_choice == "y":
+        try:
+            num_coords = int(input("How many coordinate sets do you want to input? "))
+        except ValueError:
+            print("Invalid input; defaulting to 1 coordinate set.")
+            num_coords = 1
+        for i in range(num_coords):
+            lat = input(f"Enter latitude for coordinate set {i+1} (e.g. 48.4284): ").strip() or "48.4284"
+            lon = input(f"Enter longitude for coordinate set {i+1} (e.g. -123.3656): ").strip() or "-123.3656"
+            coordinates.append((lat, lon))
+    else:
+        lat = input("Enter latitude (e.g. 48.4284): ").strip() or "48.4284"
+        lon = input("Enter longitude (e.g. -123.3656): ").strip() or "-123.3656"
+        coordinates.append((lat, lon))
+
+    slope_str = input("\nEnter slope percent (e.g. 0 for flat, 10 gentle): ").strip()
+    slope_percent = float(slope_str) if slope_str else 0.0
+
+    elev_str = input("Enter elevation (m) for foliar moisture calc (optional): ").strip()
+    elev = float(elev_str) if elev_str else 0.0
+
+    available_models = {
+        "best_match": "Auto-selected model",
+        "ecmwf": "10 days",
+        "gfs": "16 days",
+        "gem": "10 days",
+        "gem_hrdps": "2 days",
+        "knmi": "10 days",
+        "dmi": "10 days"
+    }
+    # map names
+
+    model_name_mapping = {
+        "ecmwf": "ecmwf_ifs025",
+        "gfs": "gfs_seamless",
+        "gem": "gem_seamless",
+        "hrdps": "gem_hrdps_continental",
+        "knmi": "knmi_seamless",
+        "dmi": "dmi_seamless"
+    }
+    print("\nAvailable models (chained in order):")
+    for m, days in available_models.items():
+        print(f"  - {m}: {days}")
+    model_input = input("\nEnter models to chain (comma-separated): ").strip()
+    if not model_input:
+        model_input = "ecmwf"
+    selected_models = [m.strip().lower() for m in model_input.split(",")]
+
+    print("\nAvailable FBP Fuel Types (from your script):")
+    all_fuels = [fc["fueltype"] for fc in FUEL_COEFF]
+    print("  " + ", ".join(all_fuels))
+    ft_input = input("\nEnter fuel types (comma-separated): ").strip()
+    if not ft_input:
+        ft_input = "C3"
+    fuel_types = [f.strip().upper() for f in ft_input.split(",")]
+
+   #chain forecasts from user input, apply fwi,fbp
+
+    def parse_forecast_days(txt):
+        for t in txt.split():
+            if t.isdigit():
+                return int(t)
+        return 10
+
+    api_url = "https://api.open-meteo.com/v1/forecast"
+    all_rows = []
+    for coord in coordinates:
+        coord_lat, coord_lon = coord
+        print(f"\nProcessing forecast for coordinates: Latitude {coord_lat}, Longitude {coord_lon}")
+        frames = []
+        current_dt = chain_start_dt
+        for mod in selected_models:
+            if mod not in available_models:
+                print(f"Model '{mod}' not recognized. Skipping.")
+                continue
+            days = parse_forecast_days(available_models[mod])
+            model_api = model_name_mapping.get(mod, mod)
+            end_dt = current_dt + timedelta(days=days - 1)
+            start_str = current_dt.strftime("%Y-%m-%d")
+            end_str = end_dt.strftime("%Y-%m-%d")
+            print(f"\nFetching {days} days from {start_str} to {end_str} using model '{mod}' for coordinates ({coord_lat}, {coord_lon})...")
+            params = {
+                "latitude": coord_lat,
+                "longitude": coord_lon,
+                "hourly": ["temperature_2m", "relative_humidity_2m", "precipitation", "wind_speed_10m"],
+                "models": model_api,
+                "start_date": start_str,
+                "end_date": end_str,
+                "timezone": "America/Los_Angeles"
+            }
+            try:
+                r = requests.get(api_url, params=params)
+                r.raise_for_status()
+                data = r.json()
+                hourly_data = data.get("hourly", {})
+                if not hourly_data:
+                    print(f"No hourly data for {mod} at these coordinates.")
+                    continue
+                df_mod = pd.DataFrame(hourly_data)
+                if "time" not in df_mod.columns:
+                    print(f"No 'time' column in forecast for {mod}")
+                    continue
+                df_mod["datetime"] = pd.to_datetime(df_mod["time"])
+                df_mod.drop(columns=["time"], inplace=True)
+                df_mod["model"] = mod
+                df_mod["days"] = days
+                frames.append(df_mod)
+            except requests.RequestException as e:
+                print(f"Error fetching {mod}: {e}")
+            current_dt = end_dt + timedelta(days=1)
+        if not frames:
+            print(f"No forecast data for coordinates {coord_lat}, {coord_lon}. Skipping to next set.")
+            continue
+        df_combined = pd.concat(frames, ignore_index=True)
+        df_combined.sort_values("datetime", inplace=True)
+        df_combined["date"] = df_combined["datetime"].dt.date
+        df_daily = df_combined.groupby("date", as_index=False).agg({
+            "temperature_2m": "max",
+            "relative_humidity_2m": "min",
+            "precipitation": "sum",
+            "wind_speed_10m": "max"
+        })
+        df_daily.sort_values("date", inplace=True)
+        df_daily.reset_index(drop=True, inplace=True)
+        df_daily.rename(columns={
+            "temperature_2m": "Temperature",
+            "relative_humidity_2m": "RH",
+            "precipitation": "Precip",
+            "wind_speed_10m": "Wind"
+        }, inplace=True)
+        print("\nChained daily forecast data:")
+        print(df_daily)
+        stations = df_indices["STATION"].unique()
+        for station in stations:
+            stn_df = df_indices[df_indices["STATION"] == station]
+            row = stn_df.iloc[0]
+            ffmc_init = row.get("FFMC", 85.0)
+            dmc_init = row.get("DMC", 6.0)
+            dc_init = row.get("DC", 15.0)
+            for ft in fuel_types:
+                ffmc_val = ffmc_init
+                dmc_val = dmc_init
+                dc_val = dc_init
+                print(f"\nProcessing station={station}, fuel={ft} at coordinates ({coord_lat}, {coord_lon})...")
+                for i, dayrow in df_daily.iterrows():
+                    ddate = pd.to_datetime(dayrow["date"])
+                    day_of_year = ddate.timetuple().tm_yday
+                    temp = dayrow["Temperature"]
+                    rh = dayrow["RH"]
+                    wind = dayrow["Wind"]
+                    precip = dayrow["Precip"]
+                    (new_ffmc, new_dmc, new_dc,
+                     isi, bui, fwi_val) = compute_daily_fwi(
+                        ffmc_val, dmc_val, dc_val,
+                        temp, rh, wind, precip,
+                        day_of_year
+                     )
+                    (ros, hfi) = compute_full_fbp(
+                        ft,
+                        new_ffmc,
+                        isi,
+                        bui,
+                        wind,
+                        slope_percent,
+                        float(coord_lat),
+                        elev,
+                        day_of_year
+                    )
+                    ffmc_val = new_ffmc
+                    dmc_val = new_dmc
+                    dc_val = new_dc
+                    all_rows.append({
+                        "STATION": station,
+                        "FuelType": ft,
+                        "Date": dayrow["date"],
+                        "DayIndex": i+1,
+                        "Temp": temp,
+                        "RH": rh,
+                        "Wind": wind,
+                        "Precip": precip,
+                        "FFMC": ffmc_val,
+                        "DMC": dmc_val,
+                        "DC": dc_val,
+                        "ISI": isi,
+                        "BUI": bui,
+                        "FWI": fwi_val,
+                        "ROS": ros,
+                        "HFI": hfi,
+                        "Latitude": coord_lat,
+                        "Longitude": coord_lon
+                    })
+    #bring it home, to save files on local cpu
+
+    #final output folder on your Desktop, better to have path to python projects?
+    
+    onedrive_folder = r"C:\Users\ssiddall\Desktop\ten day kickouts"
+    os.makedirs(onedrive_folder, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    if len(coordinates) == 1:
+        lat_str = coordinates[0][0].replace('.', 'p')
+        lon_str = coordinates[0][1].replace('.', 'p')
+        csv_filename = f"forecast_{timestamp}_lat{lat_str}_lon{lon_str}.csv"
+        pdf_filename = f"forecast_{timestamp}_lat{lat_str}_lon{lon_str}.pdf"
+    else:
+        csv_filename = f"forecast_{timestamp}_multi.csv"
+        pdf_filename = f"forecast_{timestamp}_multi.pdf"
+    csv_output_path = os.path.join(onedrive_folder, csv_filename)
+    pdf_output_path = os.path.join(onedrive_folder, pdf_filename)
+    out_df = pd.DataFrame(all_rows)
+    out_df.to_csv(csv_output_path, index=False)
+    print(f"\n✅ Done! Full FWI+FBP results saved to '{csv_output_path}'")
+    create_pdf_report(out_df, pdf_output_path)
+    print(f"✅ PDF saved to: {pdf_output_path}")
+
+if __name__ == "__main__":
+    main()
