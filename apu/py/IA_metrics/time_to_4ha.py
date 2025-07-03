@@ -1,3 +1,18 @@
+#####################################################################
+#####################################################################
+## author: Lochlan Noble
+## initialization date: 2025.05.09
+## purpose: Create time to 4ha IA metrics from the SFMS Daily GDB
+## notes: 
+## outputs: see folder ""
+## updated: 2025.06.18
+## To Do:
+#####################################################################
+#####################################################################
+
+
+
+# Import necessary libraries (& functions in the future)
 import fiona
 import pandas as pd
 from datetime import datetime
