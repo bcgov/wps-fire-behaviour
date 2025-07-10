@@ -6,7 +6,7 @@
 ## notes: can specify forecast or actual for fwi (ffmc, isi, FWI). 
 ##        default settings are to use yesterday's indices with actual fwi.
 ## outputs: see folder ""
-## updated: 
+## updated:
 ## TODO: - add output to handle NA data (display station name for unavailable data)
 ##       - add precipitation handling (sum daily precipitation) - daily from 00:00 and 24hr
 ##       - add description for inputs and outputs
