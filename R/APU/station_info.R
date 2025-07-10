@@ -31,7 +31,7 @@ station_info <- function(wx_file, stn_info_file) {
         stop("wx_file must be specified. Please provide the name of the weather station info file.")
     }
 
-    if (wx_file !%in% list.files(working_directory)) {
+    if (!(wx_file %in% list.files(working_directory))) {
         stop(paste("The specified wx_file:", wx_file, "does not exist in the working directory:", working_directory))
     }
     
