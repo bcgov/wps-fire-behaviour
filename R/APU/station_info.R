@@ -56,7 +56,7 @@ station_info <- function(wx_file, stn_info_file, download_to_file) {
             )
             year <- as.numeric(format(Sys.Date(), "%Y")) - 1
             info_bool <- FALSE
-            while (info_bool == FALSE & year > 2000) {
+            while (info_bool == FALSE && year > 2000) {
                 # check if info file exists for previous year
                 ftp_url <- paste0(
                 "https://www.for.gov.bc.ca/ftp/HPR/external/!publish/BCWS_DATA_MART/",
@@ -92,7 +92,7 @@ station_info <- function(wx_file, stn_info_file, download_to_file) {
             }
         }
     }
-    
+
     # Load wx data and station info files
     wx_data <- read.csv(wx_file, stringsAsFactors = FALSE)
     if (download_to_file == TRUE) {
