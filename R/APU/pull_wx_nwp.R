@@ -2,7 +2,7 @@
 #####################################################################
 ## author: Lochlan Noble
 ## initialization date: 2025.07.11
-## purpose: pull NWP weather using openmeteo API 
+## purpose: pull NWP weather using openmeteo API
 ## notes: requires daily wx data from BWCS to be compiled first for station locations
 ##        default model=null combines best available models for the location
 ##        model can be specified to use a specific NWP model (e.g., "gfs", "ecmwf", "icon")
@@ -10,13 +10,15 @@
 ##        https://open-meteo.com/en/docs
 ##        default forecast is 10 days, but can be adjusted
 ## outputs: see folder ""
-## updated: 
-## TODO: - 
+## updated:
+## TODO: - save NWP data in a structured format (e.g., CSV, RDS)
 ##       - add description for inputs and outputs
 ##       - add more examples
 ######################################################################
 ## Variables:
-## 
+## wx_data: Data frame containing weather station data with columns STATION_NAME, LATITUDE, LONGITUDE, and DATE_TIME
+## wx_file: Name of the weather station info file to read if wx_data is not provided
+## model: NWP model to use for the forecast (default is NULL, which combines best available models)
 #####################################################################
 #####################################################################
 
